@@ -1,0 +1,22 @@
+{
+  "name": "recursivesearch",
+  "module": "src/index.ts",
+  "type": "module",
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/commander": "^2.12.2",
+    "@types/luxon": "^3.4.2"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@azure/arm-resources": "^5.2.0",
+    "@azure/arm-storage": "^18.2.0",
+    "@azure/identity": "^4.2.0",
+    "@azure/storage-file-share": "^12.17.0",
+    "commander": "^12.0.0",
+    "luxon": "^3.4.4",
+    "zod": "^3.23.6"
+  }
+}
