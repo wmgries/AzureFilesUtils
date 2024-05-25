@@ -9,8 +9,9 @@ import { DefaultAzureCredential, type TokenCredential } from "@azure/identity";
 import { ResourceManagementClient } from "@azure/arm-resources";
 import { 
     StorageManagementClient, 
-    type StorageAccount 
+    type StorageAccount
 } from "@azure/arm-storage";
+import { RestError } from "@azure/core-http";
 
 import { 
     ShareServiceClient,
@@ -88,7 +89,7 @@ type SqliteColumn = {
     type: SqliteDataType;
     nullable: boolean;
     primaryKey: boolean;
-}
+};
 
 const sqliteSchemaSchema = z.array(z.object({
     cid: z.number().gte(0),
@@ -599,14 +600,56 @@ class DefaultCacheDb implements ICacheDb {
 //#endregion
 
 //#region Azure logic
-type UnknownSubscriptionFailure = {
-    readonly failureType: "UnknownSubscriptionFailure";
+type ClientType = "Resource" | "StorageControlPlane" | "StorageDataPlane";
+
+type AzureGeneralFailure = {
+    readonly failureType: "AzureGeneralFailure";
+    readonly clientType: ClientType;
     readonly subscriptionId: string;
+    readonly resourceGroupName: string;
+    readonly resourceName: string;
+    readonly fileShareName: string;
+    readonly failureDetail: unknown;
+};
+
+type AzureSubscriptionFailure = {
+    readonly failureType: "AzureSubscriptionFailure";
+    readonly clientType: Exclude<ClientType, "StorageDataPlane">;
+    readonly subscriptionId: string;
+    readonly failureDetail: RestError;
+};
+
+type AzureResourceGroupFailure = {
+    readonly failureType: "AzureResourceGroupFailure";
+    readonly clientType: Exclude<ClientType, "StorageDataPlane">;
+    readonly subscriptionId: string;
+    readonly resourceGroupName: string;
+    readonly failureDetail: RestError;
+};
+
+type AzureResourceNotFoundFailure = {
+    readonly failureType: "AzureResourceNotFoundFailure";
+    readonly clientType: Exclude<ClientType, "StorageDataPlane">;
+    readonly subscriptionId: string;
+    readonly resourceGroupName: string;
+    readonly resourceName: string;
+    readonly failureDetail?: RestError;
+};
+
+type AzureResourcePropertyUndefinedFailure = {
+    readonly failureType: "AzureResourcePropertyUndefinedFailure";
+    readonly clientType: Exclude<ClientType, "StorageDataPlane">;
+    readonly subscriptionId: string;
+    readonly resourceGroupName: string;
+    readonly resourceName: string;
+    readonly propertyName: string;
 };
 
 type GetFileShareDetailsFailure = {
     readonly failureType: "GetFileShareDetailsFailure";
-    readonly failureDetail: unknown;
+    readonly failureDetail: AzureGeneralFailure | AzureSubscriptionFailure | 
+        AzureResourceGroupFailure | AzureResourceNotFoundFailure |
+        AzureResourcePropertyUndefinedFailure;
 };
 
 interface IFileShareAdapter {
@@ -617,7 +660,8 @@ interface IFileShareAdapter {
 }
 
 class DefaultFileShareAdapter implements IFileShareAdapter {
-    protected resourceManagementClient: ResourceManagementClient | null = null;
+    protected readonly resourceManagementClient: ResourceManagementClient;
+    protected readonly storageManagementClient: StorageManagementClient;
 
     public constructor(
         protected readonly subscriptionId: string,
@@ -627,15 +671,168 @@ class DefaultFileShareAdapter implements IFileShareAdapter {
         protected readonly credential: TokenCredential = 
             new DefaultAzureCredential()
     ) {
+        this.resourceManagementClient = 
+            new ResourceManagementClient(this.credential, this.subscriptionId);
+        this.storageManagementClient = 
+            new StorageManagementClient(this.credential, this.subscriptionId);
     }
 
     public async getFileShareDetails(): Promise<Result<
         ReadonlyArray<FileShare>, 
         GetFileShareDetailsFailure
     >> {
-        this.resourceManagementClient = 
-            new ResourceManagementClient(this.credential, this.subscriptionId);
-        
+        let resourceType: ResourceType | null = null;
+        let resourceCreateDate: DateTime | null = null;
+
+        try {
+            const resourceEnumeration = this.resourceManagementClient
+                .resources
+                .listByResourceGroup(this.resourceGroupName);
+            for await (const resource of resourceEnumeration) {
+                if (resource.type !== "Microsoft.Storage/storageAccounts") {
+                    continue;
+                }
+
+                if (resource.name === this.resourceName) {
+                    resourceType = resource.type;
+                    break;
+                }
+            }
+        }
+        catch (error) {
+            if (error instanceof RestError) {
+                switch (error.code) {
+                    case "SubscriptionNotFound": {
+                        return {
+                            success: false,
+                            error: {
+                                failureType: "GetFileShareDetailsFailure",
+                                failureDetail: {
+                                    failureType: "AzureSubscriptionFailure",
+                                    clientType: "Resource",
+                                    subscriptionId: this.subscriptionId,
+                                    failureDetail: error
+                                }
+                            }
+                        };
+                    }
+
+                    case "ResourceGroupNotFound": {
+                        return {
+                            success: false,
+                            error: {
+                                failureType: "GetFileShareDetailsFailure",
+                                failureDetail: {
+                                    failureType: "AzureResourceGroupFailure",
+                                    clientType: "Resource",
+                                    subscriptionId: this.subscriptionId,
+                                    resourceGroupName: this.resourceGroupName,
+                                    failureDetail: error
+                                }
+                            }
+                        };
+                    }
+                    
+                    default: {
+                        return {
+                            success: false,
+                            error: {
+                                failureType: "GetFileShareDetailsFailure",
+                                failureDetail: {
+                                    failureType: "AzureGeneralFailure",
+                                    clientType: "Resource",
+                                    subscriptionId: this.subscriptionId,
+                                    resourceGroupName: this.resourceGroupName,
+                                    resourceName: this.resourceName,
+                                    fileShareName: this.fileShareName,
+                                    failureDetail: error
+                                }
+                            }
+                        };
+                    }
+                }
+            }
+            else {
+                return {
+                    success: false,
+                    error: {
+                        failureType: "GetFileShareDetailsFailure",
+                        failureDetail: {
+                            failureType: "AzureGeneralFailure",
+                            clientType: "Resource",
+                            subscriptionId: this.subscriptionId,
+                            resourceGroupName: this.resourceGroupName,
+                            resourceName: this.resourceName,
+                            fileShareName: this.fileShareName,
+                            failureDetail: error
+                        }
+                    }
+                };
+            }
+        }
+
+        if (resourceType === null) {
+            return {
+                success: false,
+                error: {
+                    failureType: "GetFileShareDetailsFailure",
+                    failureDetail: {
+                        failureType: "AzureResourceNotFoundFailure",
+                        clientType: "Resource",
+                        subscriptionId: this.subscriptionId,
+                        resourceGroupName: this.resourceGroupName,
+                        resourceName: this.resourceName
+                    }
+                }
+            };
+        }
+
+        switch (resourceType) {
+            case "Microsoft.Storage/storageAccounts": {
+                let storageAccount: StorageAccount;
+                try {
+                    storageAccount = await this.storageManagementClient
+                        .storageAccounts
+                        .getProperties(
+                            this.resourceGroupName, 
+                            this.resourceName
+                        );
+                }
+                catch (error) {
+                    if (error instanceof RestError) {
+                    }
+                }
+
+                if (storageAccount.creationTime === undefined) {
+                    return {
+                        success: false,
+                        error: {
+                            failureType: "GetFileShareDetailsFailure",
+                            failureDetail: {
+                                failureType: 
+                                    "AzureResourcePropertyUndefinedFailure",
+                                clientType: "StorageControlPlane",
+                                subscriptionId: this.subscriptionId,
+                                resourceGroupName: this.resourceGroupName,
+                                resourceName: this.resourceName,
+                                propertyName: "creationTime"
+                            }
+                        }
+                    };
+                }
+                
+                resourceCreateDate = DateTime.fromJSDate(
+                    storageAccount.creationTime,
+                    { zone: "UTC" }
+                );
+                break;
+            }
+
+            default: {
+                resourceType satisfies never;
+                throw new Error(`Unknown resource type: ${resourceType}.`);
+            }
+        }
 
         // Information on storage account and file share for test
         // const subscriptionId = "1d16f9b3-bbe3-48d4-930a-27a74dca003b";
